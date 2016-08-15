@@ -1,0 +1,336 @@
+rm(list=ls()) #Clean the working environment
+
+if(require('AER')==F) {install.packages('AER')} #Install (if necessary) the AER package (to do two-stage least squares regression)
+if(require('doParallel')==F) {install.packages('doParallel'); library(doParallel)} #Install (if necessary) and load the doParallel library to parallelise the simulations
+
+#Set the number of cores to be used
+registerDoParallel(cores=55)
+
+########################
+#User-defined functions#
+########################
+
+#Function to convert random numbers into genotypes
+convert_to_geno <- function(x, probs) {
+  geno <- x
+  geno[x<=quantile(x, probs=probs[1])] <- 0 
+  geno[x<=quantile(x, probs=probs[2]) & x>quantile(x, probs=probs[1])] <- 1
+  geno[x>quantile(x, probs=probs[2])] <- 2
+  return(geno)
+}
+
+#Function to simulate meiosis
+meiosis <- function(x) {
+  allele <- rep(NA, length(x))
+  allele[x==0] <- 0
+  allele[x==2] <- 1
+  allele[x==1] <- sample(0:1, sum(x==1), replace=T)
+  return(allele)
+}
+
+#Function to extract the required statistics
+get_res <- function(fit, expected_est) {
+  point_est <- as.numeric(coef(fit)[2]) #get point estimate
+  low_ci <- confint(fit)[2,1] #get lower bound of 95% CI
+  upp_ci <- confint(fit)[2,2] #get upper bound of 95% CI
+  coverage <- low_ci<=expected_est & upp_ci>=expected_est
+  power <- low_ci>0 | upp_ci<0
+  se <- summary(fit)$coef[2,2]
+  res <- c(point_est=point_est, coverage=as.numeric(coverage), power=power, se=se)
+  return(res)
+}
+
+#######################################################################
+#Define the scenarios (ie, combinations of parameters) to be simulated#
+#######################################################################
+
+n_sim <- 10000 #number of simulated datasets that will be generated for each scenario
+
+scenario <- c(1:3) #simulation scenario 
+n <- c(500, 1000, 2000, 3000, 5000, 7500, 10000) #sample size
+betaEO <- c(0, 1) #absence (0) or presence (1) of a causal effect of the exposure phenotype (E) on the outcome phenotype (O)
+CT <- c(0, 1) #absence (0) or presence of cross-trait assorative mating
+DE <- c(0, 1) #absence (0) or presence (1) of dynastic effects
+maf <- c(0.05, 0.2, 0.5, 1) #minor allele frequency (1 corresponds to an allele score of three independent variants)
+betaGE <- c(0.565, 0.315, 0.25, 0.185) #effect of the exposure-associated genotype on the exposure phenotype
+
+#Define a list (sim_parameters) containing all simulation scenarios
+sim_parameters <- list()
+count <- 1
+
+#Simulation scenario 1
+for(cur_scenario in scenario[1]) {
+  for(cur_n in n[3]) {
+    for(cur_betaEO in betaEO) {
+      for(cur_CT in CT) {
+        for(cur_DE in DE) {
+          for(cur_maf in maf[3]) {
+            for(cur_betaGE in betaGE[3]) {
+              sim_parameters[[count]] <- c(scenario=cur_scenario, n=cur_n, betaEO=cur_betaEO,
+                                           CT=cur_CT, DE=cur_DE, maf=cur_maf, betaGE=cur_betaGE)
+              count <- count+1
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+#Simulation scenario 2
+for(cur_scenario in scenario[2]) {
+  for(cur_n in n) {
+    for(cur_betaEO in betaEO[2]) {
+      for(cur_CT in CT[1]) {
+        for(cur_DE in DE[1]) {
+          for(cur_maf in maf) {
+            for(cur_betaGE in betaGE[3]) {
+              sim_parameters[[count]] <- c(scenario=cur_scenario, n=cur_n, betaEO=cur_betaEO,
+                                           CT=cur_CT, DE=cur_DE, maf=cur_maf, betaGE=cur_betaGE)
+              count <- count+1
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+#Simulation scenario 3
+for(cur_scenario in scenario[3]) {
+  for(cur_n in n) {
+    for(cur_betaEO in betaEO[2]) {
+      for(cur_CT in CT[1]) {
+        for(cur_DE in DE[1]) {
+          for(cur_maf in maf) {
+            
+            #Change betaGE to make R2 constant at 1% across different MAFs
+            if(cur_maf==0.05) { cur_betaGE <- betaGE[1] }            
+            if (cur_maf==0.2) { cur_betaGE <- betaGE[2] }
+            if (cur_maf==0.5) { cur_betaGE <- betaGE[3] }
+            if (cur_maf==1) { cur_betaGE <- betaGE[4] }
+            
+            sim_parameters[[count]] <- c(scenario=cur_scenario, n=cur_n, betaEO=cur_betaEO,
+                                         CT=cur_CT, DE=cur_DE, maf=cur_maf, betaGE=cur_betaGE)
+            count <- count+1
+          }
+        }
+      }
+    }
+  }
+}
+
+#########################
+#Perform the simulations#
+#########################
+
+#Define empty objects to store the results
+GE_res <- NULL #Results of the association between the exposure-associated genotype and the exposure phenotype in the offspring
+IV_res <- NULL #Results of the instrumental variable analysis (instrument was the exposure-associated genotype) of the association between exposure and outcome phenotypes in the offspring
+cor_genotypes_res <- NULL #Pearson correlation coefficients between genetic variables
+cor_phenotypes_res <- NULL #Pearson correlation coefficients between phenotypic variables
+
+#Go through each scenario
+for(cur_par_index in 1:length(sim_parameters)) {
+
+  print(cur_par_index) #Just to allow checking the progress of the simulations
+  
+  #Get the parameters corresponding to the current scenario
+  cur_parameters <- sim_parameters[[cur_par_index]] #Values of each parameters in the current (cur_) scenario
+  cur_n          <- cur_parameters[2] #Value of n in the current scenario
+  cur_betaEO     <- cur_parameters[3] #Value of betaEO in the current scenario
+  cur_CT         <- cur_parameters[4] #Value of CT in the current scenario
+  cur_DE         <- cur_parameters[5] #Value of DE in the current scenario
+  cur_maf        <- cur_parameters[6] #Value of maf in the current scenario
+  cur_betaGE     <- cur_parameters[7] #Value of betaGE in the current scenario
+  
+  cur_probs <- c((1-cur_maf)^2, 1-cur_maf^2)
+  
+  #For the current combination of parameters, run n_sim simulations
+  cur_res <- foreach(cur_sim=1:n_sim, .combine='rbind') %dopar% {
+    
+    library(AER)
+    
+    #Generate cross-trait assortative mating variables
+    CT_maternalGE_paternalGO <- rnorm(cur_n) #Creates an association (if cur_CT==1) between maternal exposure-associated genotype (maternalGE) and paternal outcome-associated genotype (paternalGO)
+    CT_maternalGO_paternalGE <- rnorm(cur_n) #Creates an association (if cur_CT==1) between maternal outcome-associated genotype (maternalGO) and paternal exposure-associated genotype (paternalGE)
+    
+    #Generate genotypes of the parents
+    if(cur_maf!=1) {
+      #Generate exposure-associated genotypes of the parents
+      maternalGE <- convert_to_geno(0.57*CT_maternalGE_paternalGO + rnorm(cur_n), probs=cur_probs)
+      paternalGE <- convert_to_geno(0.57*CT_maternalGO_paternalGE + rnorm(cur_n), probs=cur_probs)
+      
+      #Generate outcome-associated genotypes of the parents
+      maternalGO <- convert_to_geno(0.57*(cur_CT*CT_maternalGO_paternalGE + (1-cur_CT)*rnorm(cur_n)) + rnorm(cur_n), probs=cur_probs)
+      paternalGO <- convert_to_geno(0.57*(cur_CT*CT_maternalGE_paternalGO + (1-cur_CT)*rnorm(cur_n)) + rnorm(cur_n), probs=cur_probs)
+      
+    } else {
+      
+      #Generate exposure-associated genotypes of the parents
+      maternalGE_1 <- convert_to_geno(0.57*CT_maternalGE_paternalGO + rnorm(cur_n), probs=c((1-maf[1])^2, 1-maf[1]^2))
+      maternalGE_2 <- convert_to_geno(0.57*CT_maternalGE_paternalGO + rnorm(cur_n), probs=c((1-maf[2])^2, 1-maf[2]^2))
+      maternalGE_3 <- convert_to_geno(0.57*CT_maternalGE_paternalGO + rnorm(cur_n), probs=c((1-maf[3])^2, 1-maf[3]^2))
+      maternalGE <- maternalGE_1 + maternalGE_2 + maternalGE_3
+      
+      paternalGE_1 <- convert_to_geno(0.57*CT_maternalGO_paternalGE + rnorm(cur_n), probs=c((1-maf[1])^2, 1-maf[1]^2))
+      paternalGE_2 <- convert_to_geno(0.57*CT_maternalGO_paternalGE + rnorm(cur_n), probs=c((1-maf[2])^2, 1-maf[2]^2))
+      paternalGE_3 <- convert_to_geno(0.57*CT_maternalGO_paternalGE + rnorm(cur_n), probs=c((1-maf[3])^2, 1-maf[3]^2))
+      paternalGE <- paternalGE_1 + paternalGE_2 + paternalGE_3
+      
+      #Generate outcome-associated genotypes of the parents
+      maternalGO_1 <- convert_to_geno(0.57*(cur_CT*CT_maternalGO_paternalGE + (1-cur_CT)*rnorm(cur_n)) + rnorm(cur_n), probs=c((1-maf[1])^2, 1-maf[1]^2))
+      maternalGO_2 <- convert_to_geno(0.57*(cur_CT*CT_maternalGO_paternalGE + (1-cur_CT)*rnorm(cur_n)) + rnorm(cur_n), probs=c((1-maf[1])^2, 1-maf[1]^2))
+      maternalGO_3 <- convert_to_geno(0.57*(cur_CT*CT_maternalGO_paternalGE + (1-cur_CT)*rnorm(cur_n)) + rnorm(cur_n), probs=c((1-maf[1])^2, 1-maf[1]^2))
+      maternalGO <- maternalGO_1 + maternalGO_2 + maternalGO_3
+      
+      paternalGO_1 <- convert_to_geno(0.57*(cur_CT*CT_maternalGE_paternalGO + (1-cur_CT)*rnorm(cur_n)) + rnorm(cur_n), probs=c((1-maf[1])^2, 1-maf[1]^2))
+      paternalGO_2 <- convert_to_geno(0.57*(cur_CT*CT_maternalGE_paternalGO + (1-cur_CT)*rnorm(cur_n)) + rnorm(cur_n), probs=c((1-maf[1])^2, 1-maf[1]^2))
+      paternalGO_3 <- convert_to_geno(0.57*(cur_CT*CT_maternalGE_paternalGO + (1-cur_CT)*rnorm(cur_n)) + rnorm(cur_n), probs=c((1-maf[1])^2, 1-maf[1]^2))
+      paternalGO <- paternalGO_1 + paternalGO_2 + paternalGO_3      
+    }
+    
+    #Generate phenotypes of the parents
+    #Generate confounders of the exposure-outcome association of the parents
+    maternalC <- rnorm(cur_n)
+    paternalC <- rnorm(cur_n)
+    
+    #Generate cross-trait assortative mating variables among parents
+    CT_maternalE_paternalO <- rnorm(cur_n) #Creates an association between maternal exposure (maternalE) and paternal outcome (paternalO)
+    CT_maternalO_paternalE <- rnorm(cur_n) #Creates an association between maternal outcome (maternalO) and paternal exposure (paternalE)
+    
+    #Parental exposure
+    maternalE <- CT_maternalE_paternalO + maternalC + cur_betaGE*maternalGE + rnorm(cur_n)
+    paternalE <- CT_maternalO_paternalE + paternalC + cur_betaGE*paternalGE + rnorm(cur_n)
+    
+    #Parental outcome
+    maternalO <- cur_CT*CT_maternalO_paternalE + (1-cur_CT)*sample(CT_maternalE_paternalO, cur_n, replace=F) +
+                 cur_betaEO*maternalE + (1-cur_betaEO)*sample(maternalE, cur_n, replace=F) +
+                 maternalC + maternalGO + rnorm(cur_n)
+    
+    paternalO <- cur_CT*CT_maternalE_paternalO + (1-cur_CT)*sample(CT_maternalO_paternalE, cur_n, replace=F) +
+                 cur_betaEO*paternalE + (1-cur_betaEO)*sample(paternalE, cur_n, replace=F) +
+                 paternalC + paternalGO  + rnorm(cur_n)
+                
+    #Generate offspring genotype by meiosis
+    if(cur_maf!=1) {
+      offspringGE <- meiosis(maternalGE)+meiosis(paternalGE)    
+      offspringGO <- meiosis(maternalGO)+meiosis(paternalGO) 
+    } else {
+      offspringGE_1 <- meiosis(maternalGE_1)+meiosis(paternalGE_1)
+      offspringGE_2 <- meiosis(maternalGE_2)+meiosis(paternalGE_2)
+      offspringGE_3 <- meiosis(maternalGE_3)+meiosis(paternalGE_3)
+      offspringGE <- offspringGE_1 + offspringGE_2 + offspringGE_3
+      
+      offspringGO_1 <- meiosis(maternalGO_1)+meiosis(paternalGO_1)
+      offspringGO_2 <- meiosis(maternalGO_2)+meiosis(paternalGO_2)
+      offspringGO_3 <- meiosis(maternalGO_3)+meiosis(paternalGO_3)
+      offspringGO <- offspringGO_1 + offspringGO_2 + offspringGO_3
+    }
+    
+    #Generate exposure-outcome confounder in offspring
+    offspringC <- rnorm(cur_n)
+    
+    #Generate dynastic effects variable
+    de <- 0.14*maternalGE+0.14*maternalGO+0.14*paternalGE+0.14*paternalGO+rnorm(cur_n)
+    
+    #Generate offspring phenotypes
+    #Offspring exposure
+    offspringE <- cur_betaGE*offspringGE + cur_DE*de + (1-cur_DE)*sample(de, cur_n, replace=F) + offspringC + rnorm(cur_n)
+                
+    #Offspring outcome
+    offspringO <- cur_DE*de + (1-cur_DE)*sample(de, cur_n, replace=F) +
+                  cur_betaEO*offspringE + (1-cur_betaEO)*sample(offspringE, cur_n, replace=F) +
+                  offspringGO + offspringC + rnorm(cur_n)
+        
+    sim_res <- rbind(get_res(lm(offspringE~offspringGE), cur_betaGE),
+                     get_res(lm(offspringE~offspringGE+maternalGE+paternalGE), cur_betaGE),
+                     get_res(ivreg(offspringO~offspringE|-offspringE+offspringGE), cur_betaEO),
+                     get_res(ivreg(offspringO~offspringE+maternalGE+paternalGE|.-offspringE+offspringGE), cur_betaEO))
+        
+    cor_genotypes <- c(cor(maternalGE, paternalGE), cor(maternalGO, paternalGO),
+                       cor(maternalGE, paternalGO), cor(maternalGO, paternalGE),
+                       cor(offspringGE, offspringGO))
+    
+    cor_phenotypes <- c(cor(maternalE, paternalE), cor(maternalO, paternalO),
+                       cor(maternalE, paternalO), cor(maternalO, paternalE),
+                       cor(offspringE, offspringO))
+    
+    sim_res <- data.frame(analysis=rep(c('GE', 'IV'), each=2),
+                          adjusted=rep(c('no', 'yes'), 2),
+                          sim_res)
+    
+    cor_res <- data.frame(rep(c('cor_genotypes', 'cor_phenotypes'), each=5),
+                          rep(c('maternalGE, paternalGE', 'maternalGO, paternalGO',
+                                'maternalGE, paternalGO', 'maternalGO, paternalGE',
+                                'offspringGE, offspringGO',
+                                'maternalE, paternalE', 'maternalO, paternalO',
+                                'maternalE, paternalO', 'maternalO, paternalE',
+                                'offspringE, offspringO'), 2),
+                          c(cor_genotypes, cor_phenotypes),
+                          matrix(NA, ncol=3, nrow=10))
+    colnames(cor_res) <- colnames(sim_res)
+    
+    sim_res <- rbind(sim_res, cor_res)
+    
+    sim_res
+  }
+  
+  #Summarize the results from the simulations
+
+  #Association between exposure-associated genotype and exposure phenotype in offspring
+  cur_GE_res <- numeric(8)
+  names(cur_GE_res) <- paste(rep(c('unadjusted', 'adjusted'), each=4), c('bias', 'se', 'power', 'coverage'), sep='_')
+  
+  cur_GE_res[1] <- mean(cur_res$point_est[cur_res$analysis=='GE' & cur_res$adjusted=='no']-cur_betaGE)
+  cur_GE_res[2] <- mean(cur_res$se[cur_res$analysis=='GE' & cur_res$adjusted=='no'])
+  cur_GE_res[3] <- mean(cur_res$power[cur_res$analysis=='GE' & cur_res$adjusted=='no'])
+  cur_GE_res[4] <- mean(cur_res$coverage[cur_res$analysis=='GE' & cur_res$adjusted=='no'])
+  
+  cur_GE_res[5] <- mean(cur_res$point_est[cur_res$analysis=='GE' & cur_res$adjusted=='yes']-cur_betaGE)
+  cur_GE_res[6] <- mean(cur_res$se[cur_res$analysis=='GE' & cur_res$adjusted=='yes'])
+  cur_GE_res[7] <- mean(cur_res$power[cur_res$analysis=='GE' & cur_res$adjusted=='yes'])
+  cur_GE_res[8] <- mean(cur_res$coverage[cur_res$analysis=='GE' & cur_res$adjusted=='yes'])
+  
+  #Instrumental variable analysis of the effect of the exposure on the outcome in offspring
+  cur_IV_res <- numeric(8)
+  names(cur_IV_res) <- paste(rep(c('unadjusted', 'adjusted'), each=4), c('bias', 'se', 'power', 'coverage'), sep='_')
+  
+  cur_IV_res[1] <- mean(cur_res$point_est[cur_res$analysis=='IV' & cur_res$adjusted=='no']-cur_betaEO)
+  cur_IV_res[2] <- mean(cur_res$se[cur_res$analysis=='IV' & cur_res$adjusted=='no'])
+  cur_IV_res[3] <- mean(cur_res$power[cur_res$analysis=='IV' & cur_res$adjusted=='no'])
+  cur_IV_res[4] <- mean(cur_res$coverage[cur_res$analysis=='IV' & cur_res$adjusted=='no'])
+  
+  cur_IV_res[5] <- median(cur_res$point_est[cur_res$analysis=='IV' & cur_res$adjusted=='yes']-cur_betaEO)
+  cur_IV_res[6] <- median(cur_res$se[cur_res$analysis=='IV' & cur_res$adjusted=='yes'])
+  cur_IV_res[7] <- mean(cur_res$power[cur_res$analysis=='IV' & cur_res$adjusted=='yes'])
+  cur_IV_res[8] <- mean(cur_res$coverage[cur_res$analysis=='IV' & cur_res$adjusted=='yes'])
+   
+  #Correlation between genetic variables
+  cur_cor_genotypes <- numeric(5)
+  names(cur_cor_genotypes) <- c('maternalGE, paternalGE', 'maternalGO, paternalGO',
+                                'maternalGE, paternalGO', 'maternalGO, paternalGE',
+                                'offspringGE, offspringGO')
+  cur_cor_genotypes[1] <- mean(cur_res$point_est[cur_res$adjusted==names(cur_cor_genotypes)[1]])
+  cur_cor_genotypes[2] <- mean(cur_res$point_est[cur_res$adjusted==names(cur_cor_genotypes)[2]])
+  cur_cor_genotypes[3] <- mean(cur_res$point_est[cur_res$adjusted==names(cur_cor_genotypes)[3]])
+  cur_cor_genotypes[4] <- mean(cur_res$point_est[cur_res$adjusted==names(cur_cor_genotypes)[4]])
+  cur_cor_genotypes[5] <- mean(cur_res$point_est[cur_res$adjusted==names(cur_cor_genotypes)[5]])
+  
+  #Correlation between phenotypic variables
+  cur_cor_phenotypes <- numeric(5)
+  names(cur_cor_phenotypes) <- c('maternalE, paternalE', 'maternalO, paternalO',
+                                 'maternalE, paternalO', 'maternalO, paternalE',
+                                 'offspringE, offspringO')
+  cur_cor_phenotypes[1] <- mean(cur_res$point_est[cur_res$adjusted==names(cur_cor_phenotypes)[1]])
+  cur_cor_phenotypes[2] <- mean(cur_res$point_est[cur_res$adjusted==names(cur_cor_phenotypes)[2]])
+  cur_cor_phenotypes[3] <- mean(cur_res$point_est[cur_res$adjusted==names(cur_cor_phenotypes)[3]])
+  cur_cor_phenotypes[4] <- mean(cur_res$point_est[cur_res$adjusted==names(cur_cor_phenotypes)[4]])
+  cur_cor_phenotypes[5] <- mean(cur_res$point_est[cur_res$adjusted==names(cur_cor_phenotypes)[5]])
+  
+  #Add current parameters and include in the main correspondent variable
+  GE_res <- rbind(GE_res, as.numeric(c(cur_parameters, cur_GE_res)))
+  IV_res <- rbind(IV_res, as.numeric(c(cur_parameters, cur_IV_res)))
+  cor_genotypes_res <- rbind(cor_genotypes_res, as.numeric(c(cur_parameters, cur_cor_genotypes)))
+  cor_phenotypes_res <- rbind(cor_phenotypes_res, as.numeric(c(cur_parameters, cur_cor_phenotypes)))
+}
